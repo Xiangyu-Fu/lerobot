@@ -43,6 +43,8 @@ from lerobot.common.policies.utils import (
 )
 
 
+from torchviz import make_dot
+
 class DiffusionPolicy(
     nn.Module, 
     PyTorchModelHubMixin,  # 加载和保存模型

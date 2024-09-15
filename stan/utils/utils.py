@@ -35,3 +35,15 @@ def _replace_submodules(
     # verify that all BN are replaced
     assert not any(predicate(m) for _, m in root_module.named_modules(remove_duplicate=True))
     return root_module
+
+def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
+    """
+    Factory for noise scheduler instances of the requested type. All kwargs are passed
+    to the scheduler.
+    """
+    if name == "DDPM":
+        return DDPMScheduler(**kwargs)
+    elif name == "DDIM":
+        return DDIMScheduler(**kwargs)
+    else:
+        raise ValueError(f"Unsupported noise scheduler type {name}")

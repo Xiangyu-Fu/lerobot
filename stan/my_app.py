@@ -7,18 +7,22 @@ import torch
 from torch import nn, Tensor
 # from PIL import Image
 import torchvision
+from torchviz import make_dot
 # from torchvision.transforms import ToPILImage
 
 # Python
+import math
 import numpy as np
+import einops
 from pathlib import Path
 from collections import deque
 
 # Huggingface Lerobot, should replace with my own imports later
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.policies.normalize import Normalize, Unnormalize
 
 # my own imports
-from stan.utils.utils import _replace_submodules
+from stan.utils.utils import _replace_submodules, _make_noise_scheduler
 from stan.conf.my_configuration_diffusion import MyDiffusionConfig
 
 # class MyDiffusionConfig:
@@ -31,15 +35,32 @@ class MyDiffusionPolicy(
 ):
     def __init__(
             self, 
-            config: MyDiffusionConfig | None = None, ):
+            config: MyDiffusionConfig | None = None, 
+            dataset_stats: dict[str, dict[str, Tensor]] | None = None,  # 数据集统计信息
+            ):
         super().__init__()
         if config is None:
             config = MyDiffusionConfig()  # Here we use the default config
         self.config = config
 
+        # TODO: replace with my own implementation
+        self.normalize_inputs = Normalize(
+            config.input_shapes, config.input_normalization_modes, dataset_stats
+        )
+        self.normalize_targets = Normalize(
+            config.output_shapes, config.output_normalization_modes, dataset_stats
+        )
+        self.unnormalize_outputs = Unnormalize(
+            config.output_shapes, config.output_normalization_modes, dataset_stats
+        )
+
         self._queues = None
 
         self.diffusion = MyDiffusionModel(config)
+
+        self.expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
+
+        self.reset()
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -49,17 +70,20 @@ class MyDiffusionPolicy(
         }
         if len(self.expected_image_keys) > 0:
             self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
-        if self.use_env_state:
-            self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
+        # if self.use_env_state:
+        #     self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         # Do something with the input batch
         # input shape: (36864, 96) = (64*2*3*96, 96)
-        x = batch["observation.image"]
-        y = self.model(x)
-
+        batch = self.normalize_inputs(batch)
+        if len(self.expected_image_keys) > 0:
+            batch = dict(batch)  # Copy the batch to avoid modifying the original
+            batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
+        batch = self.normalize_targets(batch) 
+        loss = self.diffusion.compute_loss(batch)  # TODO
         # Return the output dictionary
-        return {"loss": y}
+        return {"loss": loss}
 
 
 class MyDiffusionModel(nn.Module):
@@ -75,19 +99,65 @@ class MyDiffusionModel(nn.Module):
         self._use_env_state = False
         if num_images > 0:
             self._use_images = True
-            self.image_encoder = DiffusionRgbEncoder(config)
-            global_cond_dim += config.diffusion_step_embed_dim  # ?
+            self.rgb_encoder = DiffusionRgbEncoder(config)
+            global_cond_dim += config.diffusion_step_embed_dim  # 2+128
 
         # U-Net
-        self.unet = DiffusionUnet(config, global_cond_dim)
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)  # TODO
 
-        
-        
+        # Build the noise scheduler 
+        # TODO: check the code
+        self.noise_scheduler = _make_noise_scheduler(
+            config.noise_scheduler_type,
+            num_train_timesteps=config.num_train_timesteps,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            beta_schedule=config.beta_schedule,
+            clip_sample=config.clip_sample,
+            clip_sample_range=config.clip_sample_range,
+            prediction_type=config.prediction_type,
+        )
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.model(x)
+        if config.num_inference_steps is not None:
+            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+        else:
+            self.num_inference_steps = config.num_inference_steps
+
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+        pass
+        
+    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+        n_obs_steps = batch["observation.state"].shape[1] # ？
+        horizon = batch["action"].shape[1] 
+        assert n_obs_steps == self.config.n_obs_steps
+        assert horizon == self.config.horizon
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        # Forward diffusion.
+        trajectory = batch["action"]
+        # Sample noise to add to the trajectory.
+        eps = torch.randn(trajectory.shape, device=trajectory.device)
+        # Sample a random noising timestep for each item in the batch.
+        timesteps = torch.randint(
+            low=0,
+            high=self.noise_scheduler.config.num_train_timesteps,
+            size=(trajectory.shape[0],),
+            device=trajectory.device,
+        ).long()
+        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
+        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+
+        output = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        
+        dot = make_dot(output)
+        dot.render("output", format="png")
+
+        return torch.tensor(0.0)
+
     
-
+# ================== Encoder ==================
 class DiffusionRgbEncoder(nn.Module):
     '''Encode the image observation into a 1D feature vector.
     '''
@@ -108,7 +178,7 @@ class DiffusionRgbEncoder(nn.Module):
         # getattr 获取动态属性， 等效于
         # backbone_model = torchvision.models.resnet18(pretrained=True)
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
-            pretrained=config.pretrained_vision_backbone
+            pretrained=config.pretrained_backbone_weights
         )
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
         # 替换批归一化层为组归一化层
@@ -191,8 +261,230 @@ class SptialSoftmax(nn.Module):
         feature_keypoints = excepted_xy.reshape(-1, self._out_c, 2)
 
         return feature_keypoints
-    
 
+# ================== Unet ==================
+class DiffusionConditionalUnet1d(nn.Module):
+    '''实现了一个一维卷积的条件 U-Net 模型，并结合了 FiLM(Feature-wise Linear Modulation)调节,
+    用于扩散模型的应用场景。U-Net 是一种常见的网络结构，通常用于图像分割任务，但这里使用的是一维卷积，
+    因此适用于时间序列或类似的任务。
+    该模型采用编码器-解码器结构，利用 skip connections来保留输入的高分辨率特征,并结合扩散过程的条件信息进行建模。
+    '''
+    def __init__(self, config:MyDiffusionConfig, global_cond_dim:int):
+        super().__init__()
+        self.config = config
+
+        # 1. 扩散步骤编码器, 将时间步长转化为一个与输入特征兼容的嵌入
+        self.diffusion_step_encoder = nn.Sequential(
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
+        )
+
+        # 2. FiLM条件维度 388 = 128 + 260
+        cond_dim = config.diffusion_step_embed_dim + global_cond_dim  # 这里的conditional dimension是什么？
+
+        # 3. 下采样编码器, len(config.down_dims) = 3
+        in_out = [(config.output_shapes["action"][0], config.down_dims[0])] + list(
+            zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
+        )
+
+        # 4. unet 编码器模块
+        common_res_block_kwargs = {
+            "cond_dim": cond_dim,
+            "kernel_size": config.kernel_size,
+            "n_groups": config.n_groups,
+            "use_film_scale_modulation": config.use_film_scale_modulation,
+        }
+        self.down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(
+                nn.ModuleList(
+                    [
+                        DiffusionConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
+                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Downsample as long as it is not the last block.
+                        nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+
+        # 5. 中间处理模块
+        self.mid_modules = nn.ModuleList(
+            [
+                DiffusionConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+                DiffusionConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+            ]
+        )
+
+        # 6. 上采样解码器
+        self.up_modules = nn.ModuleList([])
+        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            self.up_modules.append(
+                nn.ModuleList(
+                    [
+                        # dim_in * 2, because it takes the encoder's skip connection as well
+                        DiffusionConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
+                        DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Upsample as long as it is not the last block.
+                        nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+        
+        # 7. 最终卷积层
+        self.final_conv = nn.Sequential(
+            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            nn.Conv1d(config.down_dims[0], config.output_shapes["action"][0], 1),
+        )
+    
+    def forward(self, x:Tensor, timestep:Tensor|int, global_cond=None) -> Tensor:
+        """
+        """
+        # For 1D convolutions we'll need feature dimension first.
+        x = einops.rearrange(x, "b t d -> b d t")
+
+        # Encode the diffusion step.
+        timesteps_embed = self.diffusion_step_encoder(timestep)
+
+        # If there is a global conditioning feature, concatenate it to the timestep embedding.
+        if global_cond is not None:
+            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
+        else:
+            global_feature = timesteps_embed
+
+        # Run encoder, keeping track of skip features to pass to the decoder.
+        encoder_skip_features: list[Tensor] = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            encoder_skip_features.append(x)
+            x = downsample(x)
+
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+
+        # Run decoder, using the skip features from the encoder.
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            x = upsample(x)
+
+        x = self.final_conv(x)
+
+        x = einops.rearrange(x, "b d t -> b t d")
+        return x
+
+
+class DiffusionSinusoidalPosEmb(nn.Module):
+    """这个类实现了 1D 正弦位置嵌入，用于为时间序列数据提供位置信息。
+    通过正弦和余弦函数生成嵌入向量，并结合不同频率的缩放因子来区分不同的位置。
+    嵌入维度 dim 被分为两部分：一部分用于正弦嵌入，另一部分用于余弦嵌入。
+    TODO: look in detail about how the embedding is generated.
+    Args:
+        dim (int): 嵌入向量的维度
+    Output:
+        emb (Tensor): 位置嵌入向量, shape 为 (B, T, dim)"""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: Tensor) -> Tensor:
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x.unsqueeze(-1) * emb.unsqueeze(0)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+class DiffusionConv1dBlock(nn.Module):
+    """Conv1d --> GroupNorm --> Mish
+    这个模块适用于时间序列数据或一维特征的处理场景，包含了一个卷积层、组归一化层和 Mish 激活函数。"""
+
+    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.GroupNorm(n_groups, out_channels),
+            nn.Mish(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class DiffusionConditionalResidualBlock1d(nn.Module):
+    """DiffusionConditionalResidualBlock1d 实现了一个带有条件调节(FiLM)的 1D 卷积残差块。
+    该结构适用于处理时间序列或一维数据，允许通过条件张量对特征进行灵活的调节。
+    - FiLM 调节：可以调节每个通道的缩放(scale)和偏移(bias)，使得模型能够根据条件信息动态调整特征的分布。
+    - 残差连接：保证了梯度的稳定传递，并提供了更好的训练表现。"""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        cond_dim: int,
+        kernel_size: int = 3,
+        n_groups: int = 8,
+        # Set to True to do scale modulation with FiLM as well as bias modulation (defaults to False meaning
+        # FiLM just modulates bias).
+        use_film_scale_modulation: bool = False,
+    ):
+        super().__init__()
+
+        self.use_film_scale_modulation = use_film_scale_modulation
+        self.out_channels = out_channels
+
+        self.conv1 = DiffusionConv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
+
+        # FiLM modulation (https://arxiv.org/abs/1709.07871) outputs per-channel bias and (maybe) scale.
+        cond_channels = out_channels * 2 if use_film_scale_modulation else out_channels # if Film, then 2*out_channels
+        self.cond_encoder = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, cond_channels))
+
+        self.conv2 = DiffusionConv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups)
+
+        # A final convolution for dimension matching the residual (if needed).
+        self.residual_conv = (
+            nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        )
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, in_channels, T)
+            cond: (B, cond_dim)
+        Returns:
+            (B, out_channels, T)
+        """
+        out = self.conv1(x)
+
+        # Get condition embedding. Unsqueeze for broadcasting to `out`, resulting in (B, out_channels, 1).
+        cond_embed = self.cond_encoder(cond).unsqueeze(-1)
+        if self.use_film_scale_modulation:
+            # Treat the embedding as a list of scales and biases.
+            scale = cond_embed[:, : self.out_channels]
+            bias = cond_embed[:, self.out_channels :]
+            out = scale * out + bias
+        else:
+            # Treat the embedding as biases.
+            out = out + cond_embed
+
+        out = self.conv2(out)
+        out = out + self.residual_conv(x)
+        return out
+
+# ================== Main ==================
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def my_app(config : DictConfig) -> None:
     # print(OmegaConf.to_yaml(config))
@@ -262,8 +554,8 @@ def my_app(config : DictConfig) -> None:
     # print("Actions for the first sample:", actions[0].cpu().numpy())
 
     # Set up the the diffusion model.
-    # config = MyDiffusionConfig()
-    policy = MyDiffusionPolicy()
+    config = MyDiffusionConfig()
+    policy = MyDiffusionPolicy(config, dataset_stats=dataset.stats)
     policy.train()
     policy.to(device)
 
