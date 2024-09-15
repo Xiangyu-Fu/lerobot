@@ -44,8 +44,8 @@ from lerobot.common.policies.utils import (
 
 
 class DiffusionPolicy(
-    nn.Module,
-    PyTorchModelHubMixin,
+    nn.Module, 
+    PyTorchModelHubMixin,  # 加载和保存模型
     library_name="lerobot",
     repo_url="https://github.com/huggingface/lerobot",
     tags=["robotics", "diffusion-policy"],
@@ -59,8 +59,8 @@ class DiffusionPolicy(
 
     def __init__(
         self,
-        config: DiffusionConfig | None = None,
-        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+        config: DiffusionConfig | None = None,  # 模型的配置
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,  # 数据集统计信息
     ):
         """
         Args:
@@ -447,7 +447,7 @@ class DiffusionRgbEncoder(nn.Module):
         )
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
-        self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+        self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2])) # 获取backbone网络的特征提取部分
         if config.use_group_norm:
             if config.pretrained_backbone_weights:
                 raise ValueError(
