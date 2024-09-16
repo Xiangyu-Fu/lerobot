@@ -328,6 +328,9 @@ class DiffusionModel(nn.Module):
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
         pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
 
+        dot = make_dot(pred, params=dict(self.named_parameters()), hide=['tensor'])
+        dot.render("pred", format="png")
+
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
         if self.config.prediction_type == "epsilon":
